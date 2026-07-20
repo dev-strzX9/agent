@@ -1,0 +1,5 @@
+# 에이전트 루프(StateGraph)용. 그래프 정의와 실행에만 사용한다.
+langgraph>=0.2
+
+# LLM API 호출용. OpenAI 호환 /chat/completions를 직접 호출한다.
+requests>=2.31
