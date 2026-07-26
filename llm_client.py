@@ -1,115 +1,139 @@
 """
 llm_client.py - requests 기반 LLM API 클라이언트
 
-OpenAI SDK 같은 라이브러리 없이, requests로 직접
-OpenAI 호환 /chat/completions 엔드포인트를 호출하는 얇은 클라이언트.
-
-[왜 SDK 대신 requests인가]
-- 의존성이 가벼워지고, 요청/응답 페이로드가 그대로 보여서 디버깅이 쉽다.
-- 사내 프록시, vLLM, Ollama 등 OpenAI 호환 서버로 갈아탈 때 코드 수정이 없다.
-- 에이전트 루프(graph.py)가 메시지를 "OpenAI 포맷 dict 그대로" 다루므로
-  랭체인 메시지 객체 <-> dict 변환 비용도 없다.
-
-[이 파일이 아는 것 / 모르는 것]
-- 아는 것: HTTP 요청을 만들고, 응답에서 assistant 메시지를 꺼내는 방법.
-- 모르는 것: 어떤 툴이 있는지, 대화가 어떻게 흘러가는지.
-  -> 툴 정의는 tools/definitions.py, 루프 제어는 graph.py 책임.
+SDK 없이 requests로 OpenAI 호환 /chat/completions를 직접 호출한다.
+이 프로젝트(노드형 ReAct)에서는 tool calling을 쓰지 않는다. LLM의 역할:
+  1) extract/repair 노드에서 구조화된 JSON 출력 (chat_structured)
+  2) router 노드에서 "다음 노드 이름" JSON 출력
+  3) summarize 노드에서 최종 답변 텍스트 출력
 """
 
-# 파이썬 3.9 호환: "str | None" 같은 타입 표기(PEP 604)는 3.10+ 문법이므로,
-# 3.9에서도 동작하도록 어노테이션을 문자열로 지연 평가시킨다.
+# 파이썬 3.9 호환: "str | None" 표기(PEP 604)를 쓰기 위한 지연 평가
 from __future__ import annotations
 
-from typing import Any
+import json
+import re
+from typing import Any, Optional, Type, TypeVar
 
 import requests
+from pydantic import BaseModel, ValidationError
 
 from config import (
     LLM_API_BASE,
     LLM_API_KEY,
     LLM_MODEL,
     LLM_TEMPERATURE,
-    PARALLEL_TOOL_CALLS,
     REQUEST_TIMEOUT_SEC,
 )
 
 
 class LLMAPIError(Exception):
-    """LLM API 호출 실패를 나타내는 예외.
-
-    HTTP 에러(4xx/5xx), 타임아웃, 응답 파싱 실패를 모두 이 예외로 감싼다.
-    호출부(graph.py)에서는 이 예외 하나만 처리하면 된다.
-    """
+    """LLM API 호출 실패 (네트워크/HTTP/파싱)를 감싸는 예외."""
 
 
-def chat_completion(
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """LLM에 대화 이력을 보내고 assistant 메시지 1개를 받아온다.
+def chat_completion(messages: list[dict[str, Any]]) -> str:
+    """대화를 보내고 assistant의 텍스트 응답(content)만 받아온다.
 
     Args:
-        messages: OpenAI 포맷의 메시지 리스트. 각 원소는 다음 형태 중 하나.
-            {"role": "system",    "content": "..."}
-            {"role": "user",      "content": "..."}
-            {"role": "assistant", "content": "...", "tool_calls": [...]}  # 툴 호출 포함 가능
-            {"role": "tool",      "tool_call_id": "...", "content": "..."}  # 툴 실행 결과
-        tools: OpenAI function calling 포맷의 툴 스키마 리스트.
-            None이면 툴 없이 순수 텍스트 응답만 요청한다.
+        messages: OpenAI 포맷 메시지 리스트 (system/user/assistant).
 
     Returns:
-        응답의 choices[0].message (dict).
-        - 툴을 호출하려는 경우: "tool_calls" 키에 호출 목록이 들어있다.
-          모델이 병렬 툴 호출을 지원하면 tool_calls에 여러 개가 한번에 담긴다.
-        - 최종 답변인 경우: "content"에 텍스트만 있고 tool_calls는 없다.
+        choices[0].message.content 문자열.
 
     Raises:
         LLMAPIError: 네트워크 오류, HTTP 에러, 응답 형식 오류 시.
     """
     url = f"{LLM_API_BASE.rstrip('/')}/chat/completions"
-
     headers = {
         "Content-Type": "application/json",
-        # 로컬 서버(Ollama 등)는 키가 없어도 되지만, 헤더는 항상 보내도 무방하다.
         "Authorization": f"Bearer {LLM_API_KEY}",
     }
-
-    payload: dict[str, Any] = {
+    payload = {
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": LLM_TEMPERATURE,
     }
 
-    # 툴이 있을 때만 관련 필드를 넣는다.
-    # tool_choice="auto": 툴을 쓸지 말지 모델이 스스로 판단.
-    # (강제로 특정 툴을 쓰게 하려면 {"type": "function", "function": {"name": ...}} 형태)
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-        # 한 턴에 여러 툴을 동시에 호출할 수 있게 허용할지 여부.
-        # 약한 모델(GLM 낮은 버전 등)은 병렬 호출에서 실수가 잦아
-        # 기본 False(한 턴에 1개씩)로 둔다. 자세한 설명은 config.py 참고.
-        payload["parallel_tool_calls"] = PARALLEL_TOOL_CALLS
-
     try:
-        resp = requests.post(
-            url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SEC
-        )
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SEC)
     except requests.RequestException as e:
-        # 연결 실패, 타임아웃 등 네트워크 계층의 문제
         raise LLMAPIError(f"LLM API 요청 실패 (네트워크): {e}") from e
 
     if resp.status_code != 200:
-        # 본문에 에러 원인이 들어있는 경우가 많으므로 함께 보여준다.
-        # (예: 잘못된 API 키, 존재하지 않는 모델, 컨텍스트 초과 등)
-        raise LLMAPIError(
-            f"LLM API 오류 (HTTP {resp.status_code}): {resp.text[:500]}"
-        )
+        raise LLMAPIError(f"LLM API 오류 (HTTP {resp.status_code}): {resp.text[:500]}")
 
     try:
-        data = resp.json()
-        message = data["choices"][0]["message"]
+        return resp.json()["choices"][0]["message"]["content"] or ""
     except (ValueError, KeyError, IndexError) as e:
         raise LLMAPIError(f"LLM 응답 파싱 실패: {resp.text[:500]}") from e
 
-    return message
+
+# =============================================================================
+# 구조화 출력 (ermap_agent의 chat_structured 패턴)
+# =============================================================================
+
+M = TypeVar("M", bound=BaseModel)
+
+
+def _extract_json_block(text: str) -> str | None:
+    """LLM 출력에서 JSON 부분만 잘라낸다.
+
+    약한 모델은 "JSON만 출력해"라고 해도 코드펜스(```json)나 설명 문장을
+    붙이는 경우가 흔하다. 첫 '{'부터 마지막 '}'까지를 잘라 반환한다.
+    """
+    if not text:
+        return None
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    return text[start : end + 1]
+
+
+def chat_structured(
+    system_prompt: str,
+    user_content: str,
+    response_model: Type[M],
+) -> Optional[M]:
+    """LLM 출력을 Pydantic 모델로 강제하는 구조화 호출.
+
+    동작:
+      1. 시스템 프롬프트에 response_model의 JSON 스키마를 자동으로 붙인다.
+         (LLM이 필드 이름/타입을 볼 수 있게)
+      2. 응답에서 JSON 블록을 잘라 model_validate로 검증한다.
+         - Pydantic field_validator들이 이 시점에 실행되어
+           ID 대문자화, limit 클램프 같은 정규화가 자동 적용된다.
+      3. 파싱/검증 실패 시 None을 반환한다. (예외를 던지지 않음)
+         호출부(extract 노드)가 None을 보고 실패 phase로 처리한다.
+
+    Args:
+        system_prompt: 역할/규칙/few-shot이 담긴 시스템 프롬프트
+        user_content: 사용자 입력 (질문 등)
+        response_model: 출력 형태를 정의한 Pydantic 모델 클래스
+
+    Returns:
+        검증된 모델 인스턴스, 실패 시 None.
+    """
+    schema = json.dumps(
+        response_model.model_json_schema(), ensure_ascii=False, indent=2
+    )
+    full_system = (
+        f"{system_prompt}\n\n"
+        f"[출력 JSON 스키마]\n{schema}\n\n"
+        f"위 스키마에 맞는 JSON만 출력하세요. 다른 텍스트는 출력하지 마세요."
+    )
+
+    reply = chat_completion([
+        {"role": "system", "content": full_system},
+        {"role": "user", "content": user_content},
+    ])
+
+    block = _extract_json_block(reply)
+    if block is None:
+        return None
+
+    try:
+        return response_model.model_validate(json.loads(block))
+    except (json.JSONDecodeError, ValidationError):
+        # 형식이 심하게 깨진 경우. 호출부에서 실패로 처리하게 한다.
+        return None

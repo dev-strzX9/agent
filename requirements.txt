@@ -1,5 +1,9 @@
-# 에이전트 루프(StateGraph)용. 그래프 정의와 실행에만 사용한다.
+# 그래프 정의/실행 (StateGraph)
 langgraph>=0.2
 
-# LLM API 호출용. OpenAI 호환 /chat/completions를 직접 호출한다.
+# LLM API 호출 (OpenAI 호환 /chat/completions 직접 호출)
 requests>=2.31
+
+# 추출 결과의 스키마 강제 + 정규화 (extract/repair 노드)
+pydantic>=2
+

@@ -1,25 +1,21 @@
 """
-state.py - 랭그래프 상태 정의
+state.py - 그래프 공유 상태 정의
 
-그래프의 모든 노드가 공유하는 상태(State)를 정의한다.
+노드형 ReAct의 핵심은 state다. 판단 노드(router)는 매번 이 state를 보고
+"질문 대비 아직 부족한 조회가 뭔지"를 판단한다.
 
-[설계 결정: 랭체인 메시지 객체 대신 dict를 쓰는 이유]
-랭그래프는 보통 langchain_core의 AIMessage/HumanMessage 객체와
-add_messages 리듀서를 함께 쓰지만, 우리는 LLM을 requests로 직접
-호출하므로 API가 주고받는 "OpenAI 포맷 dict"를 그대로 상태에 쌓는다.
-- 변환 계층이 없어 디버깅 시 페이로드가 그대로 보인다.
-- llm_client.py의 입출력을 가공 없이 바로 상태에 넣을 수 있다.
+[tool calling ReAct와의 차이]
+- tool calling: 판단 근거가 messages(대화 이력 + role:"tool" 결과)
+- 노드형:       판단 근거가 구조화된 state (question + results)
+  LLM에게 매번 state를 JSON으로 보여주고 "다음 노드"만 고르게 한다.
 
-[리듀서(Annotated + operator.add)란]
-랭그래프에서 노드는 "상태 전체"가 아니라 "변경분"을 반환한다.
-- Annotated[..., operator.add] 필드: 노드가 반환한 값이 기존 값에
-  "더해진다" (리스트면 append, 숫자면 +).
-- 어노테이션이 없는 필드: 노드가 반환하면 통째로 "덮어써진다".
-  route/tasks/scenario_results는 질문마다 새로 계산되는 값이므로
-  덮어쓰기가 맞다.
+[results에 쌓이는 것]
+실행 노드(fetch_equipment, fetch_lot)가 끝날 때마다 1건씩 append 된다.
+    {"node": "fetch_equipment", "params": {"eqp_id": "..."}, "result": {...}}
+router는 이 목록을 보고 "장비는 조회했고 랏은 아직이네"를 판단한다.
 """
 
-# 파이썬 3.9 호환: 최신 타입 문법을 쓰기 위한 지연 평가
+# 파이썬 3.9 호환
 from __future__ import annotations
 
 import operator
@@ -31,26 +27,31 @@ from typing_extensions import TypedDict
 class AgentState(TypedDict, total=False):
     """에이전트 그래프의 공유 상태.
 
-    total=False: 모든 키가 필수는 아니다. 예를 들어 시나리오 경로에서는
-    turn_count가 쓰이지 않고, ReAct 경로에서는 tasks가 쓰이지 않는다.
-
     Attributes:
-        messages: OpenAI 포맷의 대화 이력. (append-only)
-            시나리오 경로: [system, user, ..., assistant(최종답변)]
-            ReAct 경로:   [system, user, ..., assistant(tool_calls), tool, ..., assistant]
-        turn_count: ReAct 폴백에서 LLM(agent) 노드가 실행된 횟수.
-            무한 툴 체이닝 방지(config.MAX_AGENT_TURNS)에 사용. (누적)
-        route: 태스크 추출 노드가 결정한 경로. "scenario" 또는 "react". (덮어쓰기)
-        route_reason: 폴백으로 간 경우 그 사유 (디버깅/로그용). (덮어쓰기)
-        tasks: 추출+검증된 태스크 목록. (덮어쓰기)
-            [{"task": "TRACE_RECENT_LOTS", "params": {...}}, ...]
-            검증 실패 태스크에는 validation_error 키가 붙어 있다.
-        scenario_results: 태스크별 실행 결과. tasks와 인덱스가 대응된다. (덮어쓰기)
+        question: 사용자의 원래 질문. 추출/판단/요약 모두의 기준.
+        queries: extract/repair가 만든 "질의 체크리스트". (덮어쓰기)
+            각 원소: {"eqp_id": ..., "needs": [...], "lot_limit": ...}
+            DB 검증 실패 시 validation_error/hint가 붙어 있다.
+            router는 이 목록과 results를 대조해 "뭐가 남았는지" 판단한다.
+        phase: 추출 파이프라인의 진행 단계. (덮어쓰기, 디버깅/로그용)
+            "extracted" -> "validated" 또는 "extraction_failed"
+        phase_message: phase에 대한 사람이 읽을 설명. (덮어쓰기)
+        results: 지금까지 실행한 조회 결과 목록. (append-only, 리듀서로 누적)
+            각 원소: {"node": 노드이름, "params": 입력, "result": 조회결과}
+        next_node: router가 결정한 다음 노드 이름. (덮어쓰기)
+            "fetch_equipment" | "fetch_lot" | "summarize"
+        next_params: 다음 노드에 넘길 파라미터. (덮어쓰기)
+            예: {"eqp_id": "EQP-PHO-01"} 또는 {"lot_ids": ["LOT-A001"]}
+        router_turns: router가 실행된 횟수. 무한 루프 방지용. (누적)
+        answer: summarize가 작성한 최종 답변.
     """
 
-    messages: Annotated[list[dict[str, Any]], operator.add]
-    turn_count: Annotated[int, operator.add]
-    route: str
-    route_reason: str
-    tasks: list[dict[str, Any]]
-    scenario_results: list[dict[str, Any]]
+    question: str
+    queries: list[dict[str, Any]]
+    phase: str
+    phase_message: str
+    results: Annotated[list[dict[str, Any]], operator.add]
+    next_node: str
+    next_params: dict[str, Any]
+    router_turns: Annotated[int, operator.add]
+    answer: str
